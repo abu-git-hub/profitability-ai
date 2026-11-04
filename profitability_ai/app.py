@@ -125,8 +125,8 @@ with st.sidebar:
     with st.expander('🤖 Настройки ИИ-аналитика'):
         st.caption('Без ключа работает локальный режим (формулы + шаблоны). С ключом Claude лишь '
                    'переформулирует ответ, а каждое число проверяется кодом.')
-        api_key = st.text_input('Anthropic API key (необязательно)', type='password',
-                                value=os.environ.get('ANTHROPIC_API_KEY', ''))
+        api_key = st.text_input('API key: Anthropic (sk-ant-…) или OpenRouter (sk-or-…), необязательно', type='password',
+                                value=os.environ.get('ANTHROPIC_API_KEY') or os.environ.get('OPENROUTER_API_KEY', ''))
         use_llm = st.checkbox('Использовать LLM для формулировок', value=False, disabled=not api_key)
     st.download_button('⬇ Скачать результаты (Excel)', to_excel_bytes(result, controls, anomalies, core_warn),
                        file_name='profitability_results.xlsx',
