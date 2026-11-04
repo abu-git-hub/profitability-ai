@@ -1,587 +1,660 @@
-"""Profitability AI — интерфейс Streamlit.
+"""ИИ-аналитик Profitability AI.
 
-Запуск:  streamlit run app.py
-Все суммы считает engine.py; ИИ-аналитик (ai_analyst.py) только объясняет.
+Принцип прозрачности: ВСЕ суммы вычисляет детерминированный код (engine.py).
+Аналитик лишь (1) понимает вопрос, (2) достаёт нужные цифры из расчёта,
+(3) формулирует объяснение и рекомендации и (4) показывает доказательства:
+таблицу, формулу, листы-источники и допущения.
+
+Два режима:
+    * «локальный» — работает всегда, без интернета и ключей: маршрутизатор
+      вопросов + шаблонные объяснения поверх посчитанных цифр;
+    * «LLM» (необязательный) — если задан ANTHROPIC_API_KEY, модель Claude лишь
+      переформулирует уже готовый локальный ответ. Затем каждое число в её
+      тексте проверяется на наличие в посчитанных данных; при расхождении
+      показывается локальный ответ (защита от выдуманных цифр).
 """
 from __future__ import annotations
 
-import io
+import json
 import os
-from pathlib import Path
+import re
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-import streamlit as st
 
 import engine as eng
-from ai_analyst import EXAMPLES, Analyst, money, pct, tg
-from theme import C_DIRECT, C_FOT, C_OVER, C_REV, NEG, NEUTRAL, PLOT_CFG, POS, hero, inject_css, kpi
 
-st.set_page_config(page_title='Profitability AI', page_icon='📊', layout='wide')
+DEFAULT_MODEL = os.environ.get('PROFITABILITY_AI_MODEL', 'claude-sonnet-5-5')
+# Имя модели для OpenRouter (формат «вендор/модель»; актуальные имена — на openrouter.ai/models)
+OPENROUTER_MODEL = os.environ.get('PROFITABILITY_AI_OR_MODEL', 'anthropic/claude-sonnet-4.5')
 
-DEMO_FILE = Path(__file__).parent / 'data' / 'Profitability_AI_Test_Data.xlsx'
-inject_css()
+EXAMPLES = [
+    'Какие ОП убыточны?',
+    'Почему у прикладной математики такой результат?',
+    'Где самый высокий ФОТ на студента?',
+    'Какая ОП самая прибыльная?',
+    'Какая себестоимость студента на общей медицине?',
+    'Что если контингент на сестринском деле вырастет на 10%?',
+    'Какие аномалии в сырых сигналах?',
+    'Как считается рентабельность?',
+]
+
+SRC_REVENUE = 'Лист «Контингент» (контракт_полный, контракт_со_скидкой, грант, тарифы, скидка_доля)'
+SRC_PAYROLL = 'Листы «Штат_ППС» (зарплата, месяцы, начисления) и «Нагрузка_ППС» (часы по ОП)'
+SRC_DIRECT = 'Лист «Прямые_затраты» (сумма_в_год_тг по op_id)'
+SRC_OVERHEAD = 'Листы «Общие_затраты» (центры затрат) и «Драйверы» (студенты, м², лаб. часы)'
+SRC_SIGNALS = 'Лист «Сырые_сигналы» (в P&L не используется)'
+
+FORMULAS = {
+    'revenue': 'Доход = Σ(контракт_полный × тариф + контракт_со_скидкой × тариф × (1 − скидка) + грант × финансирование_гранта) по всем курсам ОП',
+    'payroll': 'Годовой ФОТ преподавателя = зарплата × месяцев × (1 + начисления); доля на ОП = ФОТ × часы на ОП / все часы преподавателя',
+    'direct': 'Прямые затраты ОП = Σ строк «Прямые_затраты» с данным op_id',
+    'overhead': 'Накладные ОП = Σ по центрам (сумма центра × драйвер ОП / Σ драйвера всех 12 ОП)',
+    'total': 'Итого затраты = ФОТ + прямые + накладные',
+    'profit': 'Финансовый результат = Доход − Итого затраты',
+    'margin': 'Рентабельность, % = Финансовый результат / Доход × 100',
+    'unit': 'Себестоимость студента = Итого затраты / активные студенты (при 0 — «н/д»)',
+}
 
 
 # --------------------------------------------------------------------------
-# Вспомогательные функции (совместимость со старыми/новыми версиями Streamlit)
+# Форматирование
 # --------------------------------------------------------------------------
-def show_df(df, **kw):
-    try:
-        st.dataframe(df, width='stretch', hide_index=True, **kw)
-    except Exception:
-        st.dataframe(df, use_container_width=True, hide_index=True, **kw)
-
-
-def show_plot(fig, key=None):
-    fig.update_layout(**PLOT_CFG)
-    fig.update_xaxes(gridcolor='#e8eaf3', zerolinecolor='#c9cde6')
-    fig.update_yaxes(gridcolor='#e8eaf3', zerolinecolor='#c9cde6')
-    try:
-        st.plotly_chart(fig, width='stretch', key=key)
-    except Exception:
-        st.plotly_chart(fig, use_container_width=True, key=key)
-
-
-def spaced(x, digits=0):
+def tg(x, sign=False) -> str:
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return 'н/д'
-    return f'{x:,.{digits}f}'.replace(',', ' ').replace('-', '−')
+    s = f'{abs(x):,.0f}'.replace(',', ' ')
+    pre = '−' if x < 0 else ('+' if sign and x > 0 else '')
+    return f'{pre}{s} ₸'
 
 
-def style_money(df, money_cols=(), pct_cols=(), digits=2):
-    fm = {c: (lambda v: spaced(v, digits)) for c in money_cols if c in df.columns}
-    fm.update({c: (lambda v: 'н/д' if pd.isna(v) else f'{v:.2f}%'.replace('-', '−')) for c in pct_cols if c in df.columns})
-    return df.style.format(fm, na_rep='н/д')
+def mln(x, sign=False) -> str:
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return 'н/д'
+    pre = '−' if x < 0 else ('+' if sign and x > 0 else '')
+    return f'{pre}{abs(x) / 1e6:,.2f}'.replace(',', ' ') + ' млн ₸'
 
 
-def pill(text, kind='ok'):
-    return f'<span class="pill pill-{kind}">{text}</span>'
+def money(x, sign=False) -> str:
+    """«−42 368 719 ₸ (−42,37 млн ₸)» — точная сумма + краткая запись."""
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return 'н/д'
+    return f'{tg(x, sign)} ({mln(x, sign).replace(".", ",")})'
 
 
-def to_excel_bytes(result, controls, anomalies, warnings_df):
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine='openpyxl') as xw:
-        result.to_excel(xw, sheet_name='P&L по ОП', index=False)
-        controls.to_excel(xw, sheet_name='Контрольные суммы', index=False)
-        anomalies.drop(columns=['код'], errors='ignore').to_excel(xw, sheet_name='Аномалии', index=False)
-        warnings_df.to_excel(xw, sheet_name='Проверки данных', index=False)
-    return buf.getvalue()
+def pct(x, sign=False) -> str:
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return 'н/д'
+    body = f'{abs(x):.2f}'.replace('.', ',')
+    pre = '−' if x < 0 else ('+' if sign else '')
+    return f'{pre}{body}%'
 
 
-@st.cache_data(show_spinner='Читаю Excel и считаю P&L…')
-def process(file_bytes: bytes):
-    data = eng.load_workbook(io.BytesIO(file_bytes))
-    result, details = eng.calculate_details(data)
-    controls = eng.control_checks(data, result, details)
-    anomalies = eng.detect_signal_anomalies(data)
-    warnings_df = eng.detect_core_warnings(data, result)
-    # Проверка изоляции: P&L без листа «Сырые_сигналы» должен быть идентичен.
-    stripped = dict(data)
-    stripped['Сырые_сигналы'] = data['Сырые_сигналы'].iloc[0:0]
-    r2 = eng.calculate_financials(stripped)
-    isolation_diff = float((r2['финансовый_результат'] - result['финансовый_результат']).abs().max())
-    return data, result, details, controls, anomalies, warnings_df, isolation_diff
 
-
-# --------------------------------------------------------------------------
-# Боковая панель: данные, фильтры, настройки ИИ
-# --------------------------------------------------------------------------
-with st.sidebar:
-    st.header('📊 Profitability AI')
-    st.caption('Анализ рентабельности образовательных программ · 2025–2026')
-    uploaded = st.file_uploader('Excel с данными (.xlsx)', type=['xlsx'])
-    use_demo = False
-    if DEMO_FILE.exists():
-        use_demo = st.checkbox('Использовать встроенный демо-файл', value=uploaded is None,
-                               help='Тот же Profitability_AI_Test_Data.xlsx, без ручной правки.')
-
-if uploaded is not None:
-    file_bytes, source_name = uploaded.getvalue(), uploaded.name
-elif use_demo and DEMO_FILE.exists():
-    file_bytes, source_name = DEMO_FILE.read_bytes(), DEMO_FILE.name
-else:
-    st.title('📊 Profitability AI')
-    st.info('Загрузите Profitability_AI_Test_Data.xlsx в боковой панели, чтобы начать анализ.')
-    st.stop()
-
-try:
-    data, result, details, controls, anomalies, core_warn, isolation_diff = process(file_bytes)
-except eng.DataError as exc:
-    st.error(f'Файл не прошёл проверку структуры: {exc}')
-    st.stop()
-except Exception as exc:  # неожиданный формат
-    st.error(f'Не удалось обработать файл: {exc}')
-    st.stop()
-
-with st.sidebar:
-    st.success(f'Загружено: {source_name}')
-    st.markdown('**Фильтры**')
-    faculties = sorted(result['факультет'].dropna().unique().tolist())
-    sel_fac = st.multiselect('Факультет', faculties, default=faculties)
-    profit_filter = st.radio('Рентабельность', ['Все', 'Прибыльные', 'Убыточные'], horizontal=True)
-    with st.expander('🤖 Настройки ИИ-аналитика'):
-        st.caption('Без ключа работает локальный режим (формулы + шаблоны). С ключом Claude лишь '
-                   'переформулирует ответ, а каждое число проверяется кодом.')
-        api_key = st.text_input('API key: Anthropic (sk-ant-…) или OpenRouter (sk-or-…), необязательно', type='password',
-                                value=os.environ.get('ANTHROPIC_API_KEY') or os.environ.get('OPENROUTER_API_KEY', ''))
-        use_llm = st.checkbox('Использовать LLM для формулировок', value=False, disabled=not api_key)
-    st.download_button('⬇ Скачать результаты (Excel)', to_excel_bytes(result, controls, anomalies, core_warn),
-                       file_name='profitability_results.xlsx',
-                       mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-
-view = result[result['факультет'].isin(sel_fac)]
-if profit_filter == 'Прибыльные':
-    view = view[view['финансовый_результат'] >= 0]
-elif profit_filter == 'Убыточные':
-    view = view[view['финансовый_результат'] < 0]
-view = view.sort_values('финансовый_результат', ascending=False)
-
-analyst = Analyst(data, result, details, anomalies, controls)
-T = eng.totals(result)
-names = result.set_index('op_id')['название_ОП'].to_dict()
+def _openrouter_chat(key: str, model: str, system: str, user: str, timeout: int = 60) -> str:
+    """Запрос к OpenRouter (OpenAI-совместимый API) без дополнительных пакетов."""
+    import urllib.request
+    payload = json.dumps({
+        'model': model, 'max_tokens': 1500,
+        'messages': [{'role': 'system', 'content': system}, {'role': 'user', 'content': user}],
+    }).encode('utf-8')
+    req = urllib.request.Request(
+        'https://openrouter.ai/api/v1/chat/completions', data=payload, method='POST',
+        headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json',
+                 'HTTP-Referer': 'https://profitability-ai.streamlit.app', 'X-Title': 'Profitability AI'})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode('utf-8'))
+    return (data['choices'][0]['message']['content'] or '').strip()
 
 # --------------------------------------------------------------------------
-# Шапка
+# Ответ аналитика
 # --------------------------------------------------------------------------
-hero('Profitability AI', 'Интеллектуальный анализ рентабельности образовательных программ · учебный год 2025–2026',
-     [('✔ Контрольные суммы сходятся', 'ok') if controls['OK'].all() else ('✖ Контрольные суммы НЕ сходятся', 'bad'),
-      (f'⚠ {len(anomalies)} аномалий в «Сырые_сигналы» — не влияют на P&L', 'warn') if len(anomalies)
-      else ('✔ Аномалий в сигналах нет', 'ok'),
-      (f'{len(result)} образовательных программ', ''), (f'Файл: {source_name}', '')])
+@dataclass
+class Answer:
+    text: str
+    evidence: pd.DataFrame | None = None
+    sources: list = field(default_factory=list)
+    formulas: list = field(default_factory=list)
+    assumptions: list = field(default_factory=list)
+    mode: str = 'локальный (формулы + шаблоны)'
+    note: str = ''
+    kind: str = ''
 
-tab_dash, tab_op, tab_dq, tab_ai, tab_wi, tab_fc, tab_doc = st.tabs(
-    ['📈 Дашборд', '🎓 Образовательные программы', '🧪 Data Quality', '🤖 AI-аналитик',
-     '🔮 What-If', '📅 Прогноз набора', '📘 Методика'])
 
-# ==========================================================================
-# 1. Дашборд
-# ==========================================================================
-with tab_dash:
-    if view.empty:
-        st.warning('По выбранным фильтрам нет программ.')
-    else:
-        vt = eng.totals(view)
-        scope = 'по всем ОП' if len(view) == len(result) else f'по выбранным ОП ({len(view)} из {len(result)})'
-        st.caption(f'Итоги {scope}. Накладные всегда распределяются между всеми 12 ОП — фильтр меняет только отображение.')
-        c1, c2, c3, c4, c5 = st.columns(5)
-        _m = lambda v: f"{v / 1e6:,.1f} млн ₸".replace(',', ' ').replace('-', '−')
-        kpi(c1, 'Доход', _m(vt['доход']), f"{vt['студентов']:,.0f} студентов".replace(',', ' '), 'ind', '💰')
-        kpi(c2, 'Общие затраты', _m(vt['затраты']), f"ФОТ {vt['фот'] / 1e6:,.0f} · прям. {vt['прямые'] / 1e6:,.0f} · накл. {vt['накладные'] / 1e6:,.0f} млн", 'amb', '🧾')
-        kpi(c3, 'Финансовый результат', _m(vt['результат']), 'доход − затраты', 'pos' if vt['результат'] >= 0 else 'neg', '📈' if vt['результат'] >= 0 else '📉')
-        kpi(c4, 'Рентабельность', pct(vt['рентабельность_pct']), 'результат / доход', 'pos' if vt['рентабельность_pct'] >= 0 else 'neg', '🎯')
-        kpi(c5, 'Убыточных ОП', f"{vt['убыточных']} из {len(view)}", 'финансовый результат < 0', 'neg' if vt['убыточных'] else 'pos', '⚠️' if vt['убыточных'] else '✅')
-        st.write('')
+def _norm(s: str) -> str:
+    return str(s).lower().replace('ё', 'е').replace('−', '-').replace('–', '-')
 
-        left, right = st.columns(2)
-        with left:
-            d = view.sort_values('финансовый_результат')
-            fig = go.Figure(go.Bar(
-                x=d['финансовый_результат'] / 1e6, y=d['название_ОП'], orientation='h',
-                marker_color=[POS if v >= 0 else NEG for v in d['финансовый_результат']],
-                text=[f'{v / 1e6:,.1f}'.replace(',', ' ') for v in d['финансовый_результат']], textposition='outside',
-                hovertemplate='%{y}<br>Результат: %{x:,.2f} млн ₸<extra></extra>'))
-            fig.update_layout(title='Финансовый результат по ОП, млн ₸', height=460, xaxis_title=None, yaxis_title=None)
-            show_plot(fig, 'dash_profit')
-        with right:
-            d = view.sort_values('рентабельность_pct')
-            fig = go.Figure(go.Bar(
-                x=d['рентабельность_pct'], y=d['название_ОП'], orientation='h',
-                marker_color=[POS if v >= 0 else NEG for v in d['рентабельность_pct']],
-                text=[f'{v:.1f}%' for v in d['рентабельность_pct']], textposition='outside',
-                hovertemplate='%{y}<br>Рентабельность: %{x:.2f}%<extra></extra>'))
-            fig.update_layout(title='Рентабельность по ОП, %', height=460, xaxis_title=None, yaxis_title=None)
-            show_plot(fig, 'dash_margin')
 
-        left, right = st.columns(2)
-        with left:
-            d = view.sort_values('итого_затраты', ascending=False)
-            fig = go.Figure()
-            for col, name, colr in (('фот_оп', 'ФОТ', C_FOT), ('прямые_затраты', 'Прямые', C_DIRECT), ('накладные', 'Накладные', C_OVER)):
-                fig.add_bar(x=d['название_ОП'], y=d[col] / 1e6, name=name, marker_color=colr)
-            fig.add_scatter(x=d['название_ОП'], y=d['доход'] / 1e6, mode='markers', name='Доход',
-                            marker=dict(symbol='diamond', size=11, color=C_REV, line=dict(width=1, color='white')))
-            fig.update_layout(barmode='stack', title='Структура затрат и доход, млн ₸', height=430,
-                              xaxis_tickangle=-35, legend=dict(orientation='h', y=1.12))
-            show_plot(fig, 'dash_struct')
-        with right:
-            fig = go.Figure(go.Waterfall(
-                x=['Доход', 'ФОТ', 'Прямые затраты', 'Накладные', 'Результат'],
-                measure=['absolute', 'relative', 'relative', 'relative', 'total'],
-                y=[vt['доход'] / 1e6, -vt['фот'] / 1e6, -vt['прямые'] / 1e6, -vt['накладные'] / 1e6, 0],
-                increasing=dict(marker=dict(color=POS)), decreasing=dict(marker=dict(color=NEG)), totals=dict(marker=dict(color=C_FOT)),
-                texttemplate='%{y:,.1f}', connector=dict(line=dict(color='#aab')), ))
-            fig.update_layout(title='Как доход превращается в результат, млн ₸', height=430)
-            show_plot(fig, 'dash_waterfall')
+def _words(s: str) -> list:
+    return re.findall(r'[a-zа-я0-9]+', _norm(s))
 
-        left, right = st.columns(2)
-        with left:
-            fig = px.scatter(view, x='студентов_активных', y='себестоимость_на_студента', size='доход',
-                             color=np.where(view['финансовый_результат'] >= 0, 'Прибыльная', 'Убыточная'),
-                             color_discrete_map={'Прибыльная': POS, 'Убыточная': NEG}, hover_name='название_ОП',
-                             labels={'студентов_активных': 'Студентов', 'себестоимость_на_студента': 'Себестоимость студента, ₸',
-                                     'color': ''}, text='op_id')
-            fig.update_traces(textposition='top center')
-            fig.update_layout(title='Масштаб vs себестоимость (размер = доход)', height=430)
-            show_plot(fig, 'dash_scatter')
-        with right:
-            fg = (view.groupby('факультет', as_index=False)
-                  .agg(доход=('доход', 'sum'), затраты=('итого_затраты', 'sum'), результат=('финансовый_результат', 'sum'),
-                       ОП=('op_id', 'count')))
-            fg['рентабельность_pct'] = fg['результат'] / fg['доход'] * 100
-            fig = go.Figure()
-            fig.add_bar(x=fg['факультет'], y=fg['доход'] / 1e6, name='Доход', marker_color=C_REV)
-            fig.add_bar(x=fg['факультет'], y=fg['затраты'] / 1e6, name='Затраты', marker_color=C_FOT)
-            fig.add_bar(x=fg['факультет'], y=fg['результат'] / 1e6, name='Результат',
-                        marker_color=[POS if v >= 0 else NEG for v in fg['результат']])
-            fig.update_layout(barmode='group', title='Сравнение факультетов, млн ₸', height=430, xaxis_tickangle=-20,
-                              legend=dict(orientation='h', y=1.12))
-            show_plot(fig, 'dash_fac')
 
-        st.subheader('Результаты по образовательным программам')
-        cols = ['op_id', 'название_ОП', 'факультет', 'студентов_активных', 'доход', 'фот_оп', 'прямые_затраты', 'накладные',
-                'итого_затраты', 'финансовый_результат', 'рентабельность_pct', 'себестоимость_на_студента']
-        tbl = view[cols].rename(columns={'студентов_активных': 'студентов'}).reset_index(drop=True)
-        tbl.loc[len(tbl)] = ['', 'ИТОГО', '', vt['студентов'], vt['доход'], vt['фот'], vt['прямые'], vt['накладные'],
-                             vt['затраты'], vt['результат'], vt['рентабельность_pct'], vt['себестоимость_на_студента']]
-        show_df(style_money(tbl, ['доход', 'фот_оп', 'прямые_затраты', 'накладные', 'итого_затраты', 'финансовый_результат',
-                                  'себестоимость_на_студента'], ['рентабельность_pct']))
-        st.subheader('Факультеты')
-        show_df(style_money(fg, ['доход', 'затраты', 'результат'], ['рентабельность_pct']))
+def _stem_hit(token: str, qwords: list) -> bool:
+    stem = token[:max(4, len(token) - 2)]
+    return any(w.startswith(stem) and abs(len(w) - len(token)) <= 2 for w in qwords)
 
-# ==========================================================================
-# 2. Образовательные программы
-# ==========================================================================
-with tab_op:
-    op_id = st.selectbox('Образовательная программа', list(names), format_func=lambda o: f'{o} · {names[o]}', key='op_sel')
-    x = result.set_index('op_id').loc[op_id]
-    st.markdown(f"**{x['название_ОП']}** · {x['факультет']} · {x.get('уровень', '')} · срок {x.get('срок_обучения_лет', '')} г.")
-    m1, m2, m3, m4, m5 = st.columns(5)
-    _m = lambda v: f"{v / 1e6:,.2f} млн ₸".replace(',', ' ').replace('-', '−')
-    kpi(m1, 'Доход', _m(x['доход']), f"{x['студентов_активных']:.0f} студентов", 'ind', '💰')
-    kpi(m2, 'Затраты', _m(x['итого_затраты']), 'ФОТ + прямые + накладные', 'amb', '🧾')
-    kpi(m3, 'Результат', _m(x['финансовый_результат']), 'доход − затраты', 'pos' if x['финансовый_результат'] >= 0 else 'neg',
-        '📈' if x['финансовый_результат'] >= 0 else '📉')
-    kpi(m4, 'Рентабельность', pct(x['рентабельность_pct']), 'результат / доход', 'pos' if x['рентабельность_pct'] >= 0 else 'neg', '🎯')
-    kpi(m5, 'Себестоимость студента', tg(x['себестоимость_на_студента']), 'затраты / студенты', 'sky', '🎓')
-    st.write('')
 
-    left, right = st.columns([1, 1])
-    with left:
-        den = x['доход'] if x['доход'] else np.nan
-        pl = pd.DataFrame({
-            'Статья': ['Доход', '− ФОТ', '− Прямые затраты', '− Накладные', '= Итого затраты', '= Финансовый результат'],
-            'Сумма, ₸': [x['доход'], -x['фот_оп'], -x['прямые_затраты'], -x['накладные'], -x['итого_затраты'], x['финансовый_результат']],
-            'Доля дохода, %': [100.0, x['фот_оп'] / den * 100, x['прямые_затраты'] / den * 100, x['накладные'] / den * 100,
-                               x['итого_затраты'] / den * 100, x['рентабельность_pct']]})
-        st.markdown('##### P&L программы')
-        show_df(style_money(pl, ['Сумма, ₸'], ['Доля дохода, %']))
-        fig = go.Figure(go.Waterfall(
-            x=['Доход', 'ФОТ', 'Прямые', 'Накладные', 'Результат'], measure=['absolute', 'relative', 'relative', 'relative', 'total'],
-            y=[x['доход'] / 1e6, -x['фот_оп'] / 1e6, -x['прямые_затраты'] / 1e6, -x['накладные'] / 1e6, 0],
-            increasing=dict(marker=dict(color=POS)), decreasing=dict(marker=dict(color=NEG)), totals=dict(marker=dict(color=C_FOT)),
-            texttemplate='%{y:,.1f}'))
-        fig.update_layout(title='Доход → результат, млн ₸', height=330)
-        show_plot(fig, 'op_wf')
-    with right:
-        T_ = T
-        cmp_df = pd.DataFrame({
-            'Показатель на студента, ₸': ['Доход', 'ФОТ', 'Прямые затраты', 'Накладные', 'Себестоимость'],
-            'ОП': [x['доход'] / x['студентов_активных'], x['фот_оп'] / x['студентов_активных'],
-                   x['прямые_затраты'] / x['студентов_активных'], x['накладные'] / x['студентов_активных'],
-                   x['себестоимость_на_студента']],
-            'Среднее по вузу': [T_['доход'] / T_['студентов'], T_['фот'] / T_['студентов'], T_['прямые'] / T_['студентов'],
-                                T_['накладные'] / T_['студентов'], T_['себестоимость_на_студента']]})
-        cmp_df['Отклонение, %'] = (cmp_df['ОП'] / cmp_df['Среднее по вузу'] - 1) * 100
-        st.markdown('##### Сравнение со средним по вузу')
-        show_df(style_money(cmp_df, ['ОП', 'Среднее по вузу'], ['Отклонение, %']))
-        fig = go.Figure()
-        fig.add_bar(x=cmp_df['Показатель на студента, ₸'], y=cmp_df['ОП'], name=x['название_ОП'], marker_color=C_FOT)
-        fig.add_bar(x=cmp_df['Показатель на студента, ₸'], y=cmp_df['Среднее по вузу'], name='Среднее по вузу', marker_color='#b8c0cc')
-        fig.update_layout(barmode='group', title='На одного студента, ₸', height=330, legend=dict(orientation='h', y=1.15))
-        show_plot(fig, 'op_cmp')
+class Analyst:
+    def __init__(self, data: dict, result: pd.DataFrame, details: dict,
+                 anomalies: pd.DataFrame | None = None, controls: pd.DataFrame | None = None):
+        self.data = data
+        self.result = result.copy()
+        self.details = details
+        self.anomalies = anomalies if anomalies is not None else eng.detect_signal_anomalies(data)
+        self.controls = controls if controls is not None else eng.control_checks(data, result, details)
+        self.t = eng.totals(result)
+        self.names = result.set_index('op_id')['название_ОП'].to_dict()
+        self.r = result.set_index('op_id')
 
-    st.markdown('##### Детализация расчёта (проверяемые строки)')
-    t1, t2, t3, t4 = st.tabs(['Доход по курсам', 'ФОТ по преподавателям', 'Накладные по центрам', 'Прямые затраты'])
-    with t1:
-        rv = details['revenue']
-        rv = rv[rv['op_id'] == op_id][['курс', 'контракт_полный', 'контракт_со_скидкой', 'грант', 'тариф_контракт_тг',
-                                      'скидка_доля', 'финансирование_грант_тг', 'доход_контракт_полный',
-                                      'доход_контракт_скидка', 'доход_грант', 'доход']]
-        show_df(style_money(rv, ['тариф_контракт_тг', 'финансирование_грант_тг', 'доход_контракт_полный', 'доход_контракт_скидка',
-                                 'доход_грант', 'доход'], digits=0))
-        st.caption(f'Σ дохода = {tg(rv["доход"].sum())}. Формула: полный × тариф + со скидкой × тариф × (1 − скидка) + грант × финансирование.')
-    with t2:
-        pw = details['payroll']
-        pw = pw[pw['op_id'] == op_id][['teacher_id', 'часы_в_год', 'всего_часов_преподавателя', 'доля_часов', 'годовой_фот', 'фот_оп']]
-        pw = pw.assign(доля_часов=pw['доля_часов'] * 100).rename(columns={'доля_часов': 'доля часов, %'})
-        show_df(style_money(pw.sort_values('фот_оп', ascending=False), ['годовой_фот', 'фот_оп'], ['доля часов, %'], digits=0))
-        st.caption(f'Σ ФОТ ОП = {tg(pw["фот_оп"].sum())}. ФОТ ОП = годовой ФОТ преподавателя × часы на ОП / все часы преподавателя.')
-    with t3:
-        oh = details['overhead']
-        oh = oh[oh['op_id'] == op_id][['cost_center_id', 'статья', 'драйвер', 'сумма_центра', 'значение_драйвера',
-                                       'сумма_драйверов', 'доля', 'накладные']]
-        oh = oh.assign(доля=oh['доля'] * 100).rename(columns={'доля': 'доля ОП в драйвере, %'})
-        show_df(style_money(oh, ['сумма_центра', 'значение_драйвера', 'сумма_драйверов', 'накладные'], ['доля ОП в драйвере, %'], digits=0))
-        st.caption(f'Σ накладных ОП = {tg(oh["накладные"].sum())}. Накладные = сумма центра × драйвер ОП / Σ драйвера 12 ОП.')
-    with t4:
-        dd = details['direct']
-        dd = dd[dd['op_id'] == op_id]
-        show_df(style_money(dd, ['сумма_в_год_тг'], digits=0))
-        st.caption(f'Σ прямых затрат = {tg(dd["сумма_в_год_тг"].sum())}.')
+    # ------------------------------------------------------------------ поиск
+    def find_programs(self, question: str) -> list:
+        q = _norm(question)
+        qw = _words(question)
+        found = {}
+        for m in re.finditer(r'(?:op|оп)[\s\-_]*0*(\d{1,3})', q):
+            oid = f'OP-{int(m.group(1)):03d}'
+            if oid in self.names:
+                found[oid] = 100
+        for oid, name in self.names.items():
+            toks = [t for t in _words(name) if len(t) >= 4]
+            hits = [t for t in toks if _stem_hit(t, qw)]
+            if hits and (any(len(t) >= 7 for t in hits) or len(hits) == len(toks)):
+                found[oid] = max(found.get(oid, 0), sum(len(t) for t in hits))
+        return [o for o, _ in sorted(found.items(), key=lambda kv: -kv[1])]
 
-    if st.button('🤖 Объяснить ОП', type='primary', key='explain_btn'):
-        ans = analyst.a_explain(op_id)
-        st.markdown(ans.text)
-        with st.expander('Доказательства: разложение, формулы, источники'):
-            show_df(style_money(ans.evidence, ['ОП, ₸/студента', 'Среднее по вузу, ₸/студента', 'Вклад в результат, ₸'], digits=0))
-            st.markdown('**Формулы**\n' + '\n'.join(f'- {f}' for f in ans.formulas))
-            st.markdown('**Источники**\n' + '\n'.join(f'- {s}' for s in ans.sources))
-            st.markdown('**Допущения**\n' + '\n'.join(f'- {a}' for a in ans.assumptions))
+    def find_faculty(self, question: str):
+        qw = _words(question)
+        for fac in self.result['факультет'].dropna().unique():
+            first = _words(fac)[0]
+            if len(first) >= 4 and _stem_hit(first, qw) and any(w.startswith('факульт') for w in qw):
+                return fac
+        return None
 
-# ==========================================================================
-# 3. Data Quality
-# ==========================================================================
-with tab_dq:
-    st.subheader('Структура файла')
-    st.success(f'Все {len(eng.REQUIRED_SHEETS)} обязательных листов и колонок найдены; числовые поля приведены к числам.')
+    # ------------------------------------------------------------- маршрутизатор
+    def answer(self, question: str, llm: bool = False, api_key: str | None = None,
+               model: str | None = None) -> Answer:
+        base = self._route(question)
+        if llm and (api_key or os.environ.get('ANTHROPIC_API_KEY') or os.environ.get('OPENROUTER_API_KEY')):
+            return self._rephrase_with_llm(question, base, api_key, model or DEFAULT_MODEL)
+        return base
 
-    st.subheader('Аномалии в «Сырые_сигналы»')
-    if anomalies.empty:
-        st.success('Аномалий не найдено.')
-    else:
-        st.warning(f'Найдено **{len(anomalies)}** проблемных записей. Лист «Сырые_сигналы» полностью исключён из финансового расчёта.')
-        show_df(anomalies.drop(columns=['код']))
-        by_type = anomalies['Тип ошибки'].value_counts().reset_index()
-        by_type.columns = ['Тип ошибки', 'Количество']
-        show_df(by_type)
-    if isolation_diff == 0:
-        st.success('Проверка изоляции: P&L, посчитанный БЕЗ листа «Сырые_сигналы», идентичен основному (расхождение 0 ₸) — '
-                   'проблемные записи не влияют на расчёт.')
-    else:
-        st.error(f'Расхождение P&L при исключении листа сигналов: {isolation_diff:,.2f} ₸')
+    def _route(self, question: str) -> Answer:
+        q = _norm(question)
+        ops = self.find_programs(question)
+        fac = self.find_faculty(question)
+        has = lambda *pats: any(re.search(p, q) for p in pats)
 
-    st.subheader('Контрольные суммы (приёмочные испытания)')
-    ctl = controls.copy()
-    ctl['OK'] = ctl['OK'].map({True: '✅', False: '❌'})
-    show_df(style_money(ctl, ['Ожидается', 'Получено', 'Разница'], digits=2))
-    st.caption(f'Допуск по суммам — {eng.TOLERANCE_TG:g} ₸. Все проверки пройдены: {"да" if controls["OK"].all() else "НЕТ"}.')
+        if has(r'аномал', r'ошибк', r'качеств', r'сырые', r'сигнал', r'дубл', r'проблемн\w* (данн|строк|запис)'):
+            return self.a_anomalies()
+        if has(r'что если', r'что будет', r'сценар', r'вырастет', r'снизится', r'увелич\w+ (контингент|набор|студент)',
+               r'уменьш\w+ (контингент|набор|студент)', r'what.?if', r'\b[+\-]\s?\d+\s?%'):
+            return self.a_scenario(question, ops)
+        if has(r'формул', r'как (считается|считают|рассчит|определя)', r'методик', r'как посчит'):
+            return self.a_formulas(q)
+        if has(r'убыточ', r'убыток', r'в минус', r'отрицательн\w* (результат|рентабельн)', r'не покрыва', r'нерентабельн'):
+            return self.a_losses()
+        if has(r'почему', r'объясни', r'причин', r'из-за чего', r'что влияет', r'разбер\w+', r'проанализируй') and ops:
+            return self.a_explain(ops[0])
+        if has(r'как[аоие]\w* (оп|программ)\w* (самая )?(прибыльн|лучш)', r'самая прибыльн', r'самые прибыльн',
+               r'прибыльн\w* (оп|программ)', r'топ'):
+            return self.a_ranking('финансовый_результат', ascending=False)
+        metric = self._metric(q)
+        ranking_words = has(r'сам\w+', r'наибольш', r'наименьш', r'максим', r'миним', r'\bгде\b', r'топ\b',
+                            r'рейтинг', r'выше всего', r'ниже всего', r'лучш', r'худш', r'высок', r'низк')
+        if len(ops) >= 2 and has(r'сравни', r'против', r'\bи\b', r'или'):
+            return self.a_compare(ops[:3])
+        if metric and ops and not ranking_words:
+            return self.a_op_metric(ops[0], metric)
+        if metric:
+            asc = has(r'наименьш', r'минимальн', r'низк', r'меньше всего', r'худш', r'ниже всего')
+            return self.a_ranking(metric, ascending=asc)
+        if ops:
+            return self.a_op_summary(ops[0])
+        if fac:
+            return self.a_faculty(fac)
+        if has(r'факультет'):
+            return self.a_faculties()
+        if has(r'итого', r'в целом', r'весь университет', r'общ\w+ (картин|результат|итог)', r'сводк', r'всего', r'университет'):
+            return self.a_overview()
+        return self.a_help()
 
-    st.subheader('Дополнительные проверки основных листов')
-    show_df(core_warn)
+    def _metric(self, q: str):
+        table = [
+            (r'фот\w* на (одного )?студент', 'фот_на_студента'),
+            (r'себестоимост', 'себестоимость_на_студента'),
+            (r'доход\w* на (одного )?студент', 'доход_на_студента'),
+            (r'рентабельн|маржа|маржинальн', 'рентабельность_pct'),
+            (r'накладн', 'накладные'),
+            (r'прямы\w+ (затрат|расход)', 'прямые_затраты'),
+            (r'\bфот\b|зарплат|оплат\w+ труда', 'фот_оп'),
+            (r'прибыл|финансов\w+ результат|результат', 'финансовый_результат'),
+            (r'доход|выручк', 'доход'),
+            (r'затрат|расход', 'итого_затраты'),
+        ]
+        for pat, col in table:
+            if re.search(pat, q):
+                return col
+        return None
 
-# ==========================================================================
-# 4. AI-аналитик
-# ==========================================================================
-with tab_ai:
-    st.subheader('Спросите ИИ-аналитика')
-    st.caption('Суммы считает код (engine.py), аналитик объясняет и показывает доказательства: формулу, лист-источник, допущения.')
-    if 'chat' not in st.session_state:
-        st.session_state.chat = []
+    # ------------------------------------------------------------ готовые ответы
+    METRIC_LABEL = {
+        'фот_на_студента': ('ФОТ на студента', 'тг/студента', 'ФОТ ОП / активные студенты', [SRC_PAYROLL, 'Лист «Драйверы» (студентов_активных)'], ['payroll']),
+        'себестоимость_на_студента': ('Себестоимость на студента', 'тг/студента', 'Итого затраты ОП / активные студенты', [SRC_PAYROLL, SRC_DIRECT, SRC_OVERHEAD], ['total', 'unit']),
+        'доход_на_студента': ('Доход на студента', 'тг/студента', 'Доход ОП / активные студенты', [SRC_REVENUE], ['revenue']),
+        'рентабельность_pct': ('Рентабельность', '%', 'Финансовый результат / Доход × 100', [SRC_REVENUE, SRC_PAYROLL, SRC_DIRECT, SRC_OVERHEAD], ['profit', 'margin']),
+        'накладные': ('Накладные затраты', 'тг', 'Σ(сумма центра × драйвер ОП / Σ драйвера)', [SRC_OVERHEAD], ['overhead']),
+        'прямые_затраты': ('Прямые затраты', 'тг', 'Σ строк «Прямые_затраты» по op_id', [SRC_DIRECT], ['direct']),
+        'фот_оп': ('ФОТ', 'тг', 'Σ годовой ФОТ преподавателя × доля часов на ОП', [SRC_PAYROLL], ['payroll']),
+        'финансовый_результат': ('Финансовый результат', 'тг', 'Доход − (ФОТ + прямые + накладные)', [SRC_REVENUE, SRC_PAYROLL, SRC_DIRECT, SRC_OVERHEAD], ['profit']),
+        'доход': ('Доход', 'тг', 'Σ(полный × тариф + со скидкой × тариф × (1−скидка) + грант × финансирование)', [SRC_REVENUE], ['revenue']),
+        'итого_затраты': ('Итого затраты', 'тг', 'ФОТ + прямые + накладные', [SRC_PAYROLL, SRC_DIRECT, SRC_OVERHEAD], ['total']),
+    }
 
-    def render_answer(ans):
-        st.markdown(ans.text)
-        if ans.note:
-            st.caption('ℹ ' + ans.note)
-        if ans.evidence is not None or ans.formulas or ans.sources or ans.assumptions:
-            with st.expander('📎 Доказательства: таблица, формулы, источники, допущения'):
-                if ans.evidence is not None:
-                    money_like = [c for c in ans.evidence.columns if ans.evidence[c].dtype.kind == 'f' and 'pct' not in c and '%' not in c and 'рентаб' not in c.lower()]
-                    pct_like = [c for c in ans.evidence.columns if 'pct' in c or '%' in c or 'рентаб' in c.lower()]
-                    show_df(style_money(ans.evidence, money_like, pct_like, digits=2))
-                if ans.formulas:
-                    st.markdown('**Формулы**\n' + '\n'.join(f'- {f}' for f in ans.formulas))
-                if ans.sources:
-                    st.markdown('**Источники данных**\n' + '\n'.join(f'- {s}' for s in ans.sources))
-                if ans.assumptions:
-                    st.markdown('**Допущения**\n' + '\n'.join(f'- {a}' for a in ans.assumptions))
-        st.caption(f'Режим: {ans.mode}')
+    def _fmt_metric(self, col, v):
+        if col == 'рентабельность_pct':
+            return pct(v)
+        return tg(v)
 
-    cols = st.columns(4)
-    pending = None
-    for i, ex in enumerate(EXAMPLES):
-        if cols[i % 4].button(ex, key=f'ex_{i}'):
-            pending = ex
-    c_a, c_b = st.columns([3, 1])
-    with c_a:
-        explain_op = st.selectbox('Объяснить ОП', list(names), format_func=lambda o: f'{o} · {names[o]}', key='ai_op')
-    with c_b:
-        st.write('')
-        st.write('')
-        if st.button('Объяснить выбранную ОП', key='ai_explain'):
-            pending = f'Объясни {names[explain_op]} ({explain_op})'
+    def a_ranking(self, col: str, ascending: bool = False, top: int = 12) -> Answer:
+        label, unit, formula, sources, fkeys = self.METRIC_LABEL[col]
+        df = self.result[['op_id', 'название_ОП', 'факультет', col]].dropna(subset=[col])
+        df = df.sort_values(col, ascending=ascending).reset_index(drop=True)
+        best = df.iloc[0]
+        word = 'наименьшее' if ascending else 'наибольшее'
+        avg_line = ''
+        if col in ('фот_на_студента', 'себестоимость_на_студента', 'доход_на_студента'):
+            num = {'фот_на_студента': self.t['фот'], 'себестоимость_на_студента': self.t['затраты'],
+                   'доход_на_студента': self.t['доход']}[col]
+            avg_line = f' Среднее по университету: {tg(num / self.t["студентов"])} (Σ / {self.t["студентов"]:,.0f} студентов).'.replace(',', ' ')
+        text = (f'**{word.capitalize()} значение — «{best["название_ОП"]}» ({best["op_id"]}): '
+                f'{self._fmt_metric(col, best[col])}** ({label.lower()}).{avg_line}\n\n'
+                f'Ниже полный рейтинг всех {len(df)} ОП по показателю «{label}».')
+        if col == 'фот_на_студента':
+            top3 = df.head(3) if not ascending else df.tail(3)
+            text += ('\n\nВысокий ФОТ на студента обычно означает малый контингент при фиксированном '
+                     'составе преподавателей: ' + '; '.join(
+                         f'{r["название_ОП"]} — {self.r.loc[r["op_id"], "студентов_активных"]:.0f} студ., '
+                         f'ФОТ {tg(self.r.loc[r["op_id"], "фот_оп"])}' for _, r in top3.iterrows()) + '.')
+        ev = df.copy()
+        ev.columns = ['op_id', 'ОП', 'Факультет', label]
+        return Answer(text, ev, sources, [FORMULAS[k] for k in fkeys], [], kind='ranking')
 
-    for msg in st.session_state.chat:
-        with st.chat_message(msg['role']):
-            if msg['role'] == 'user':
-                st.markdown(msg['content'])
-            else:
-                render_answer(msg['answer'])
+    def a_losses(self) -> Answer:
+        r = self.result
+        loss = r[r['финансовый_результат'] < 0].sort_values('финансовый_результат')
+        thin = r[(r['финансовый_результат'] >= 0) & (r['рентабельность_pct'] < 10)]
+        if loss.empty:
+            text = 'Убыточных ОП нет: у всех 12 программ финансовый результат ≥ 0.'
+        else:
+            lines = [f'- **{x.название_ОП}** ({x.op_id}): результат {money(x.финансовый_результат)}, '
+                     f'рентабельность {pct(x.рентабельность_pct)}, доход {tg(x.доход)}, затраты {tg(x.итого_затраты)}'
+                     for x in loss.itertuples()]
+            text = (f'Убыточны **{len(loss)} из {len(r)}** ОП (финансовый результат < 0), суммарный убыток '
+                    f'{money(loss["финансовый_результат"].sum())}:\n' + '\n'.join(lines))
+        if len(thin):
+            text += ('\n\nНа грани (результат ≥ 0, но рентабельность < 10%): ' + '; '.join(
+                f'{x.название_ОП} ({pct(x.рентабельность_pct)})' for x in thin.itertuples()) + '.')
+        text += ('\n\n_Убыток — финансовый результат учебной модели, а не кассовый остаток. Решения о судьбе ОП нельзя '
+                 'принимать только по нему: нужны академические, кадровые, стратегические и социальные основания._')
+        ev = r[['op_id', 'название_ОП', 'доход', 'фот_оп', 'прямые_затраты', 'накладные', 'итого_затраты',
+                'финансовый_результат', 'рентабельность_pct']].sort_values('финансовый_результат')
+        return Answer(text, ev, [SRC_REVENUE, SRC_PAYROLL, SRC_DIRECT, SRC_OVERHEAD],
+                      [FORMULAS['total'], FORMULAS['profit'], FORMULAS['margin']], kind='losses')
 
-    with st.form('ask_form', clear_on_submit=True):
-        typed = st.text_input('Ваш вопрос', placeholder='Например: Почему у прикладной математики такой результат?')
-        asked = st.form_submit_button('Спросить')
-    question = pending or (typed.strip() if asked and typed.strip() else None)
-    if question:
-        st.session_state.chat.append({'role': 'user', 'content': question})
-        with st.chat_message('user'):
-            st.markdown(question)
-        with st.chat_message('assistant'):
-            ans = analyst.answer(question, llm=bool(use_llm and api_key), api_key=api_key or None)
-            render_answer(ans)
-        st.session_state.chat.append({'role': 'assistant', 'answer': ans})
-    if st.session_state.chat and st.button('Очистить диалог'):
-        st.session_state.chat = []
-        st.rerun()
+    # ---- объяснение ОП ------------------------------------------------------
+    def explain_factors(self, op_id: str) -> pd.DataFrame:
+        """Точное разложение отклонения результата ОП от «среднего по вузу на студента».
 
-# ==========================================================================
-# 5. What-If
-# ==========================================================================
-with tab_wi:
-    st.subheader('Сценарий: изменение контингента')
-    st.caption('Базовый сценарий кейса: доход пропорционален студентам; ФОТ и прямые затраты неизменны; общая сумма накладных '
-               'неизменна, но центры с драйвером students перераспределяются по обновлённому контингенту.')
-    default_ops = [o for o in result.sort_values('финансовый_результат')['op_id'].head(1)]
-    wi_ops = st.multiselect('ОП для изменения', list(names), default=default_ops, format_func=lambda o: f'{o} · {names[o]}')
-    st.session_state.setdefault('wi_pct', 10)
-
-    def _set_pct(v):
-        st.session_state['wi_pct'] = v
-
-    b1, b2, b3, _ = st.columns([1, 1, 1, 5])
-    b1.button('+10%', on_click=_set_pct, args=(10,))
-    b2.button('−10%', on_click=_set_pct, args=(-10,))
-    b3.button('0%', on_click=_set_pct, args=(0,))
-    wi_pct = st.slider('Изменение числа студентов, %', -50, 50, key='wi_pct')
-    with st.expander('⚙ Допущения (по умолчанию — базовый вариант кейса)'):
-        grant_follows = st.checkbox('Грантовые студенты тоже меняются', value=True,
-                                    help='Если выключить: грантовые места фиксированы госзаказом, меняются только платные.')
-        pv = st.slider('Доля ФОТ, меняющаяся вместе с контингентом, %', 0, 100, 0)
-        dv = st.slider('Доля прямых затрат, меняющаяся вместе с контингентом, %', 0, 100, 0)
-        tariff = st.slider('Изменение тарифа контракта, %', -20, 30, 0)
-
-    if not wi_ops:
-        st.info('Выберите хотя бы одну ОП.')
-    else:
-        changes = {o: wi_pct / 100 for o in wi_ops}
-        tchg = {o: tariff / 100 for o in wi_ops} if tariff else None
-        sim = eng.simulate_enrollment(data, changes, grant_follows=grant_follows, payroll_var_share=pv / 100,
-                                      direct_var_share=dv / 100, tariff_change=tchg)
-        tb, ts = sim['totals_base'], sim['totals_scenario']
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric('Доход вуза', f"{ts['доход'] / 1e6:,.1f} млн ₸".replace(',', ' '),
-                  f"{(ts['доход'] - tb['доход']) / 1e6:+,.2f} млн".replace(',', ' '))
-        k2.metric('Затраты вуза', f"{ts['затраты'] / 1e6:,.1f} млн ₸".replace(',', ' '),
-                  f"{(ts['затраты'] - tb['затраты']) / 1e6:+,.2f} млн".replace(',', ' '), delta_color='inverse')
-        k3.metric('Результат вуза', f"{ts['результат'] / 1e6:,.1f} млн ₸".replace(',', ' '),
-                  f"{(ts['результат'] - tb['результат']) / 1e6:+,.2f} млн".replace(',', ' '))
-        k4.metric('Рентабельность вуза', pct(ts['рентабельность_pct']), f"{ts['рентабельность_pct'] - tb['рентабельность_pct']:+.2f} п.п.")
-
-        dlt = sim['delta']
-        fig = go.Figure()
-        fig.add_bar(x=dlt['название_ОП'], y=dlt['финансовый_результат_до'] / 1e6, name='До', marker_color='#b8c0cc')
-        fig.add_bar(x=dlt['название_ОП'], y=dlt['финансовый_результат_после'] / 1e6, name='После', marker_color=C_FOT)
-        fig.update_layout(barmode='group', title='Финансовый результат до / после, млн ₸', height=420,
-                          xaxis_tickangle=-35, legend=dict(orientation='h', y=1.12))
-        show_plot(fig, 'wi_cmp')
-
-        sel = dlt[dlt['op_id'].isin(wi_ops)]
+        Результат ОП − студенты × (средний результат на студента) =
+            Δдоход − ΔФОТ − Δпрямые − Δнакладные, где Δ = (показатель ОП на студента − среднее) × студенты ОП.
+        Сумма вкладов равна отклонению тождественно (проверяется в тестах).
+        """
+        r = self.r.loc[op_id]
+        n = r['студентов_активных']
+        T = self.t
+        avg = {'доход': T['доход'] / T['студентов'], 'фот': T['фот'] / T['студентов'],
+               'прямые': T['прямые'] / T['студентов'], 'накладные': T['накладные'] / T['студентов']}
+        own = {'доход': r['доход'] / n, 'фот': r['фот_оп'] / n, 'прямые': r['прямые_затраты'] / n,
+               'накладные': r['накладные'] / n}
         rows = []
-        for _, rr in sel.iterrows():
-            for label, col in (('Студентов', 'студентов_активных'), ('Доход', 'доход'), ('ФОТ', 'фот_оп'),
-                               ('Прямые затраты', 'прямые_затраты'), ('Накладные', 'накладные'),
-                               ('Итого затраты', 'итого_затраты'), ('Финансовый результат', 'финансовый_результат'),
-                               ('Рентабельность, %', 'рентабельность_pct'), ('Себестоимость студента', 'себестоимость_на_студента')):
-                rows.append({'ОП': rr['название_ОП'], 'Показатель': label, 'До': rr[f'{col}_до'],
-                             'После': rr[f'{col}_после'], 'Δ': rr[f'{col}_Δ']})
-        st.markdown('##### Изменённые ОП')
-        show_df(style_money(pd.DataFrame(rows), ['До', 'После', 'Δ'], digits=2))
+        for key, label, sign in (('доход', 'Доход на студента', +1), ('фот', 'ФОТ на студента', -1),
+                                 ('прямые', 'Прямые затраты на студента', -1), ('накладные', 'Накладные на студента', -1)):
+            contrib = sign * (own[key] - avg[key]) * n
+            rows.append({'Фактор': label, 'ОП, ₸/студента': own[key], 'Среднее по вузу, ₸/студента': avg[key],
+                         'Вклад в результат, ₸': contrib})
+        return pd.DataFrame(rows)
 
-        with st.expander('Как перераспределились накладные по всем 12 ОП'):
-            ov = dlt[['op_id', 'название_ОП', 'накладные_до', 'накладные_после', 'накладные_Δ']].copy()
-            show_df(style_money(ov, ['накладные_до', 'накладные_после', 'накладные_Δ'], digits=0))
-            st.caption(f'Σ накладных до = {tg(sim["base"]["накладные"].sum())}; после = {tg(sim["scenario"]["накладные"].sum())} '
-                       '(общая сумма не меняется).')
+    def _overhead_by_driver(self, op_id: str) -> dict:
+        oh = self.details['overhead']
+        g = oh.groupby(['op_id', 'драйвер'])['накладные'].sum().unstack(fill_value=0)
+        return g.loc[op_id].to_dict() if op_id in g.index else {}
 
-        if len(wi_ops) == 1:
-            be = eng.breakeven_growth(data, wi_ops[0], grant_follows=False)
-            if be == 0:
-                st.success('ОП уже безубыточна.')
-            elif be is None:
-                st.info('Безубыточность недостижима ростом платного контингента в модели (при росте до +1000%).')
+    def a_explain(self, op_id: str) -> Answer:
+        r = self.r.loc[op_id]
+        T = self.t
+        n = r['студентов_активных']
+        fac = self.explain_factors(op_id)
+        avg_profit_pp = T['результат'] / T['студентов']
+        deviation = r['финансовый_результат'] - n * avg_profit_pp
+        fac_sorted = fac.reindex(fac['Вклад в результат, ₸'].abs().sort_values(ascending=False).index)
+        lines = []
+        shown = 0
+        for _, f in fac_sorted.iterrows():
+            c = f['Вклад в результат, ₸']
+            if shown >= 5:
+                break
+            direction = 'повышает' if c > 0 else 'снижает'
+            lines.append(f'{shown + 1}. **{f["Фактор"]}**: {tg(f["ОП, ₸/студента"])} против среднего '
+                         f'{tg(f["Среднее по вузу, ₸/студента"])} → {direction} результат на {tg(abs(c))}.')
+            shown += 1
+        # дополнительные факторы
+        rev_total = r['доход']
+        disc_loss = float(self.details['revenue'].query('op_id == @op_id').eval(
+            'контракт_со_скидкой * тариф_контракт_тг * скидка_доля').sum())
+        grant_share = r['доход_грант'] / rev_total * 100 if rev_total else float('nan')
+        univ_grant_share = self.result['доход_грант'].sum() / T['доход'] * 100
+        hours_pp = r['часов_ппс'] / n if n else float('nan')
+        univ_hours_pp = self.result['часов_ппс'].sum() / T['студентов']
+        extras = [
+            f'Структура дохода: грант даёт {pct(grant_share)} дохода ОП (по вузу — {pct(univ_grant_share)}); '
+            f'скидки уменьшают доход на {tg(disc_loss)}.',
+            f'Нагрузка ППС: {hours_pp:.1f} ч на студента (по вузу — {univ_hours_pp:.1f}); '
+            f'преподавателей на ОП: {int(r["преподавателей"])}; часов в год: {r["часов_ппс"]:,.0f}.'.replace(',', ' '),
+        ]
+        by_driver = self._overhead_by_driver(op_id)
+        ohd = ', '.join(f'{eng.DRIVER_RU.get(k, k)}: {tg(v)}' for k, v in by_driver.items())
+        extras.append(f'Накладные по драйверам: {ohd}. Площадь ОП — {r["площадь_м2"]:.0f} м² '
+                      f'({r["площадь_м2"] / n:.2f} м² на студента), лаб. часы — {r["лабораторные_часы"]:.0f}.')
+        # управленческие варианты (считаются движком)
+        options, opt_ev = self._options(op_id)
+        verdict = ('убыточна' if r['финансовый_результат'] < 0 else
+                   'прибыльна, но с низкой маржой' if r['рентабельность_pct'] < 10 else 'прибыльна')
+        head = (f'**{r["название_ОП"]} ({op_id}) {verdict}**: доход {money(r["доход"])}, затраты {money(r["итого_затраты"])}, '
+                f'результат {money(r["финансовый_результат"])}, рентабельность {pct(r["рентабельность_pct"])}, '
+                f'себестоимость студента {tg(r["себестоимость_на_студента"])} при {n:.0f} студентах.\n\n'
+                f'**Почему так — факторы** (разложение отклонения от среднего по вузу на студента; '
+                f'сумма вкладов = {tg(deviation, True)} = результат ОП − {n:.0f} × средний результат на студента '
+                f'{tg(avg_profit_pp)}):\n')
+        text = (head + '\n'.join(lines) + '\n\n**Дополнительно:**\n' + '\n'.join(f'- {e}' for e in extras)
+                + '\n\n**Управленческие варианты** (эффект посчитан движком, не ИИ):\n' + options
+                + '\n\n_Финансовый результат — не повод закрывать программу сам по себе: учитывайте академические, кадровые, '
+                  'стратегические и социальные основания._')
+        ev = pd.concat([fac, pd.DataFrame([{'Фактор': 'ИТОГО отклонение от среднего', 'Вклад в результат, ₸': fac['Вклад в результат, ₸'].sum()}])],
+                       ignore_index=True)
+        return Answer(text, ev, [SRC_REVENUE, SRC_PAYROLL, SRC_DIRECT, SRC_OVERHEAD],
+                      [FORMULAS[k] for k in ('revenue', 'payroll', 'direct', 'overhead', 'profit', 'unit')],
+                      ['Сравнение со средним по вузу на студента: Σ показателя всех ОП / Σ активных студентов.',
+                       'Варианты — сценарии на тех же данных; предположения указаны рядом с каждым.'] ,
+                      kind='explain')
+
+    def _options(self, op_id: str):
+        base_p = float(self.r.loc[op_id, 'финансовый_результат'])
+        # 1) +10% платных студентов
+        s1 = eng.simulate_enrollment(self.data, {op_id: 0.10}, grant_follows=False)
+        d1 = float(s1['delta'].loc[s1['delta']['op_id'] == op_id, 'финансовый_результат_Δ'].iloc[0])
+        be = eng.breakeven_growth(self.data, op_id, grant_follows=False)
+        be_txt = ('ОП уже безубыточна.' if be == 0 else
+                  f'Безубыточность в этой модели при росте платных студентов на ≈{be:.0%}.' if be is not None else
+                  'Безубыточность недостижима ростом платного контингента в разумных пределах.')
+        # 2) тариф +5%
+        s2 = eng.simulate_enrollment(self.data, {}, tariff_change={op_id: 0.05})
+        d2 = float(s2['delta'].loc[s2['delta']['op_id'] == op_id, 'финансовый_результат_Δ'].iloc[0])
+        # 3) ФОТ −5%
+        d3 = 0.05 * float(self.r.loc[op_id, 'фот_оп'])
+        pl = self.details['payroll']
+        t_here = set(pl.loc[pl['op_id'] == op_id, 'teacher_id'])
+        shared = int(sum(1 for t in t_here if pl.loc[pl['teacher_id'] == t, 'op_id'].nunique() > 1))
+        text = (f'- **A. Рост платного набора на 10%** (грантовые места не меняются): результат {tg(d1, True)}. {be_txt} '
+                f'_Риски:_ спрос ограничен (по «История_набора» зачисление нестабильно), потребуются аудитории и группы; '
+                f'модель линейна и не учитывает пороги.\n'
+                f'- **Б. Повышение тарифа контракта на 5%**: результат {tg(d2, True)}. '
+                f'_Риски:_ отток абитуриентов к конкурентам, снижение конверсии; эффект зависит от эластичности спроса, которой нет в данных.\n'
+                f'- **В. Оптимизация нагрузки/ФОТ на 5%**: ≈ {tg(d3, True)} (5% × ФОТ ОП {tg(self.r.loc[op_id, "фот_оп"])}). '
+                f'_Риски:_ качество преподавания и аккредитационные требования; {shared} из {len(t_here)} преподавателей ОП '
+                f'ведут занятия и на других ОП — экономия может переместиться, а не исчезнуть.')
+        ev = pd.DataFrame([
+            {'Вариант': 'A. +10% платных студентов', 'Эффект на результат ОП, ₸': d1},
+            {'Вариант': 'Б. Тариф контракта +5%', 'Эффект на результат ОП, ₸': d2},
+            {'Вариант': 'В. ФОТ −5%', 'Эффект на результат ОП, ₸': d3}])
+        return text, ev
+
+    # ---- прочие ответы --------------------------------------------------------
+    def a_op_summary(self, op_id: str) -> Answer:
+        x = self.r.loc[op_id]
+        text = (f'**{x["название_ОП"]} ({op_id}), {x["факультет"]}**\n\n'
+                f'- Доход: {money(x["доход"])} (полный контракт {tg(x["доход_контракт_полный"])}, со скидкой '
+                f'{tg(x["доход_контракт_скидка"])}, грант {tg(x["доход_грант"])})\n'
+                f'- ФОТ: {money(x["фот_оп"])}\n- Прямые затраты: {money(x["прямые_затраты"])}\n'
+                f'- Накладные: {money(x["накладные"])}\n- Итого затраты: {money(x["итого_затраты"])}\n'
+                f'- **Финансовый результат: {money(x["финансовый_результат"])}**, рентабельность {pct(x["рентабельность_pct"])}\n'
+                f'- Студентов: {x["студентов_активных"]:.0f}, себестоимость студента {tg(x["себестоимость_на_студента"])}\n\n'
+                f'Чтобы разобрать причины, спросите: «Почему у {x["название_ОП"].lower()} такой результат?»')
+        ev = pd.DataFrame([{'Статья': k, 'Сумма, ₸': x[c]} for k, c in (
+            ('Доход', 'доход'), ('ФОТ', 'фот_оп'), ('Прямые затраты', 'прямые_затраты'), ('Накладные', 'накладные'),
+            ('Итого затраты', 'итого_затраты'), ('Финансовый результат', 'финансовый_результат'))])
+        return Answer(text, ev, [SRC_REVENUE, SRC_PAYROLL, SRC_DIRECT, SRC_OVERHEAD],
+                      [FORMULAS[k] for k in ('revenue', 'payroll', 'direct', 'overhead', 'profit', 'margin')], kind='op')
+
+    def a_op_metric(self, op_id: str, col: str) -> Answer:
+        label, unit, formula, sources, fkeys = self.METRIC_LABEL[col]
+        v = self.r.loc[op_id, col]
+        rank = int(self.result[col].rank(ascending=False, method='min')[self.result['op_id'] == op_id].iloc[0])
+        text = (f'**{label} — {self.names[op_id]} ({op_id}): {self._fmt_metric(col, v)}**. '
+                f'Это {rank}-е место из {len(self.result)} по убыванию показателя.\n\nФормула: {formula}.')
+        ev = self.a_ranking(col).evidence
+        return Answer(text, ev, sources, [FORMULAS[k] for k in fkeys], kind='metric')
+
+    def a_compare(self, ops: list) -> Answer:
+        cols = ['op_id', 'название_ОП', 'студентов_активных', 'доход', 'фот_оп', 'прямые_затраты', 'накладные',
+                'итого_затраты', 'финансовый_результат', 'рентабельность_pct', 'себестоимость_на_студента']
+        ev = self.result[self.result['op_id'].isin(ops)][cols]
+        best = ev.sort_values('рентабельность_pct', ascending=False).iloc[0]
+        text = (f'Сравнение {len(ev)} ОП. Лучшая рентабельность — **{best["название_ОП"]}: {pct(best["рентабельность_pct"])}** '
+                f'(результат {money(best["финансовый_результат"])}). Полные цифры — в таблице ниже.')
+        return Answer(text, ev, [SRC_REVENUE, SRC_PAYROLL, SRC_DIRECT, SRC_OVERHEAD],
+                      [FORMULAS['profit'], FORMULAS['margin']], kind='compare')
+
+    def a_faculty(self, fac: str) -> Answer:
+        g = self.result[self.result['факультет'] == fac]
+        rev, cost = g['доход'].sum(), g['итого_затраты'].sum()
+        text = (f'**{fac}** ({len(g)} ОП): доход {money(rev)}, затраты {money(cost)}, результат {money(rev - cost)}, '
+                f'рентабельность {pct((rev - cost) / rev * 100 if rev else float("nan"))}.')
+        return Answer(text, g[['op_id', 'название_ОП', 'доход', 'итого_затраты', 'финансовый_результат', 'рентабельность_pct']],
+                      [SRC_REVENUE, SRC_PAYROLL, SRC_DIRECT, SRC_OVERHEAD], [FORMULAS['profit'], FORMULAS['margin']], kind='faculty')
+
+    def a_faculties(self) -> Answer:
+        g = (self.result.groupby('факультет', as_index=False)
+             .agg(ОП=('op_id', 'count'), доход=('доход', 'sum'), затраты=('итого_затраты', 'sum'),
+                  результат=('финансовый_результат', 'sum')))
+        g['рентабельность_pct'] = g['результат'] / g['доход'] * 100
+        g = g.sort_values('результат', ascending=False)
+        top, bot = g.iloc[0], g.iloc[-1]
+        text = (f'Лучший факультет по результату — **{top["факультет"]}: {money(top["результат"])}** '
+                f'({pct(top["рентабельность_pct"])}); наименьший результат — **{bot["факультет"]}: {money(bot["результат"])}** '
+                f'({pct(bot["рентабельность_pct"])}).')
+        return Answer(text, g, [SRC_REVENUE, SRC_PAYROLL, SRC_DIRECT, SRC_OVERHEAD], [FORMULAS['profit']], kind='faculties')
+
+    def a_overview(self) -> Answer:
+        T = self.t
+        text = (f'**Университет в целом (12 ОП, 2025–2026):** доход {money(T["доход"])}, затраты {money(T["затраты"])} '
+                f'(ФОТ {tg(T["фот"])}, прямые {tg(T["прямые"])}, накладные {tg(T["накладные"])}), '
+                f'**результат {money(T["результат"])}**, рентабельность {pct(T["рентабельность_pct"])}. '
+                f'Убыточных ОП: {T["убыточных"]}. Контрольные суммы сходятся: '
+                f'{"да" if self.controls["OK"].all() else "НЕТ — см. вкладку Data Quality"}.')
+        return Answer(text, self.result[['op_id', 'название_ОП', 'доход', 'итого_затраты', 'финансовый_результат', 'рентабельность_pct']],
+                      [SRC_REVENUE, SRC_PAYROLL, SRC_DIRECT, SRC_OVERHEAD], [FORMULAS['total'], FORMULAS['profit']], kind='overview')
+
+    def a_anomalies(self) -> Answer:
+        a = self.anomalies
+        if a.empty:
+            return Answer('В листе «Сырые_сигналы» аномалий не найдено.', None, [SRC_SIGNALS], [], kind='anomalies')
+        lines = [f'- **{x["ID строки"]}** (строка Excel {x["Строка Excel"]}) — {x["Тип ошибки"]}: {x["Почему подозрительно"]} '
+                 f'→ _{x["Рекомендуемое действие"]}_' for _, x in a.iterrows()]
+        text = (f'В «Сырые_сигналы» найдено **{len(a)} проблем(ы)**. Ни одна из них не попадает в расчёт P&L: '
+                f'лист в финансовой модели не используется (проверено тестом: расчёт без листа идентичен).\n\n' + '\n'.join(lines))
+        return Answer(text, a.drop(columns=['код'], errors='ignore'), [SRC_SIGNALS],
+                      ['Правила: дубликат ID; op_id отсутствует в «ОП»; значение < 0; процент > 100; пусто; период вне допустимых.'],
+                      kind='anomalies')
+
+    def a_formulas(self, q: str) -> Answer:
+        keys = list(FORMULAS)
+        if re.search(r'рентабельн', q):
+            keys = ['profit', 'margin']
+        elif re.search(r'фот|зарплат', q):
+            keys = ['payroll']
+        elif re.search(r'накладн', q):
+            keys = ['overhead']
+        elif re.search(r'доход', q):
+            keys = ['revenue']
+        elif re.search(r'себестоим', q):
+            keys = ['total', 'unit']
+        text = 'Расчёт идёт по методике кейса:\n\n' + '\n'.join(f'- {FORMULAS[k]}' for k in keys)
+        text += ('\n\nПримеры с реальными цифрами смотрите во вкладке «Образовательные программы» '
+                 '(построчная детализация ФОТ и накладных).')
+        return Answer(text, None, [SRC_REVENUE, SRC_PAYROLL, SRC_DIRECT, SRC_OVERHEAD], [FORMULAS[k] for k in keys],
+                      ['Учебная модель: тенге, один год; налог на прибыль, амортизация, стипендии, инвестиции не моделируются.'],
+                      kind='formulas')
+
+    def a_scenario(self, question: str, ops: list) -> Answer:
+        q = _norm(question)
+        m = re.search(r'([+\-]?)\s?(\d+(?:[.,]\d+)?)\s?%', q)
+        if m:
+            val = float(m.group(2).replace(',', '.')) / 100
+            neg = m.group(1) == '-' or re.search(r'сниз|уменьш|сократ|упад|меньше|падени', q)
+            val = -val if (neg and not (m.group(1) == '+')) else val
+        else:
+            val = 0.10
+        if not ops:
+            return Answer('Укажите, для какой ОП считать сценарий, например: «Что если контингент на информатике вырастет на 10%?». '
+                          'Либо откройте вкладку «What-If» для интерактивного расчёта.', kind='scenario')
+        op = ops[0]
+        s = eng.simulate_enrollment(self.data, {op: val}, grant_follows=True)
+        d = s['delta']
+        x = d[d['op_id'] == op].iloc[0]
+        tb, ts = s['totals_base'], s['totals_scenario']
+        text = (f'**Сценарий: контингент «{self.names[op]}» ({op}) {val:+.0%}** (студентов {x["студентов_активных_до"]:.0f} → '
+                f'{x["студентов_активных_после"]:.1f}).\n\n'
+                f'- Доход ОП: {money(x["доход_до"])} → {money(x["доход_после"])} ({tg(x["доход_Δ"], True)})\n'
+                f'- ФОТ и прямые — без изменений (ФОТ {tg(x["фот_оп_после"])}, прямые {tg(x["прямые_затраты_после"])})\n'
+                f'- Накладные ОП: {tg(x["накладные_до"])} → {tg(x["накладные_после"])} ({tg(x["накладные_Δ"], True)}) — '
+                f'общая сумма 500 млн неизменна, центры по students перераспределяются\n'
+                f'- **Результат ОП: {money(x["финансовый_результат_до"])} → {money(x["финансовый_результат_после"])} '
+                f'({tg(x["финансовый_результат_Δ"], True)})**, рентабельность {pct(x["рентабельность_pct_до"])} → {pct(x["рентабельность_pct_после"])}\n'
+                f'- Университет: результат {money(tb["результат"])} → {money(ts["результат"])} ({tg(ts["результат"] - tb["результат"], True)})')
+        ev = pd.DataFrame([{'Показатель': lab, 'До': x[f'{c}_до'], 'После': x[f'{c}_после'], 'Δ': x[f'{c}_Δ']}
+                           for lab, c in (('Студентов', 'студентов_активных'), ('Доход, ₸', 'доход'), ('ФОТ, ₸', 'фот_оп'),
+                                          ('Прямые затраты, ₸', 'прямые_затраты'), ('Накладные, ₸', 'накладные'),
+                                          ('Итого затраты, ₸', 'итого_затраты'), ('Финансовый результат, ₸', 'финансовый_результат'),
+                                          ('Рентабельность, %', 'рентабельность_pct'))])
+        return Answer(text, ev, [SRC_REVENUE, SRC_OVERHEAD, 'Вкладка «What-If» — тот же расчёт с настраиваемыми допущениями'],
+                      [FORMULAS['revenue'], FORMULAS['overhead']],
+                      eng.scenario_assumptions({op: val}, self.names, True, 0, 0), kind='scenario')
+
+    def a_help(self) -> Answer:
+        text = ('Я отвечаю на вопросы по рассчитанным данным университета. Все суммы считает код, я лишь объясняю.\n\n'
+                'Попробуйте:\n' + '\n'.join(f'- {e}' for e in EXAMPLES))
+        return Answer(text, None, [], [], kind='help')
+
+    # ------------------------------------------------------------------ LLM слой
+    def facts_json(self, base: Answer) -> str:
+        cols = ['op_id', 'название_ОП', 'факультет', 'доход', 'фот_оп', 'прямые_затраты', 'накладные',
+                'итого_затраты', 'финансовый_результат', 'рентабельность_pct', 'студентов_активных',
+                'себестоимость_на_студента', 'фот_на_студента', 'доход_на_студента']
+        facts = {
+            'университет': {k: (None if (isinstance(v, float) and np.isnan(v)) else round(float(v), 2)) for k, v in self.t.items()},
+            'ОП': json.loads(self.result[cols].round(2).to_json(orient='records', force_ascii=False)),
+            'аномалии_сырых_сигналов': json.loads(self.anomalies.drop(columns=['код'], errors='ignore').astype(object)
+                                                  .where(self.anomalies.notna(), None).to_json(orient='records', force_ascii=False)),
+            'готовый_ответ_кода': base.text,
+            'доказательства': (json.loads(base.evidence.round(2).to_json(orient='records', force_ascii=False))
+                               if base.evidence is not None else None),
+        }
+        return json.dumps(facts, ensure_ascii=False)
+
+    def _rephrase_with_llm(self, question, base: Answer, api_key, model) -> Answer:
+        key = (api_key or os.environ.get('ANTHROPIC_API_KEY') or os.environ.get('OPENROUTER_API_KEY') or '').strip().strip('"\'')
+        use_openrouter = key.startswith('sk-or-')
+        if use_openrouter:
+            model = os.environ.get('PROFITABILITY_AI_OR_MODEL', OPENROUTER_MODEL)
+        else:
+            try:
+                import anthropic  # type: ignore
+            except Exception:
+                base.note = 'Пакет anthropic не установлен — показан локальный ответ.'
+                return base
+        facts = self.facts_json(base)
+        system = (
+            'Ты ИИ-аналитик финансов университета (учебный датасет, тенге, 2025–2026). Правила: '
+            '1) используй ТОЛЬКО числа из блока FACTS, не вычисляй новых сумм и не округляй иначе; '
+            '2) если данных для ответа нет — так и скажи; 3) всегда называй источник (лист Excel) и формулу; '
+            '4) не утверждай, что ОП нужно закрыть по финансовым причинам; 5) отвечай по-русски, кратко, '
+            'сохраняя структуру и все ключевые цифры из «готовый_ответ_кода».')
+        user_msg = f'Вопрос: {question}\n\nFACTS:\n{facts}'
+        try:
+            if use_openrouter:
+                text = _openrouter_chat(key, model, system, user_msg)
             else:
-                st.info(f'**Точка безубыточности:** при неизменных ФОТ и прямых затратах «{names[wi_ops[0]]}» выходит в ноль '
-                        f'при росте платных студентов на ≈ **{be:.0%}** (грантовые места не меняются). '
-                        'Практически это означает, что одним набором проблему не решить.')
-        st.markdown('##### Допущения сценария')
-        for a in eng.scenario_assumptions(changes, names, grant_follows, pv / 100, dv / 100, tchg):
-            st.markdown(f'- {a}')
+                client = anthropic.Anthropic(api_key=key)
+                msg = client.messages.create(
+                    model=model, max_tokens=1500, system=system,
+                    messages=[{'role': 'user', 'content': user_msg}])
+                text = ''.join(b.text for b in msg.content if getattr(b, 'type', '') == 'text').strip()
+        except Exception as exc:  # сеть, ключ, лимиты
+            base.note = f'LLM недоступна ({type(exc).__name__}: {str(exc)[:160]}) — показан локальный ответ.'
+            return base
+        if not text:
+            base.note = 'LLM вернула пустой ответ — показан локальный ответ.'
+            return base
+        bad = unverified_numbers(text, facts + ' ' + question)
+        if bad:
+            base.note = ('Ответ LLM отклонён проверкой чисел (нет в расчёте: ' + ', '.join(bad[:6])
+                         + ') — показан проверенный локальный ответ.')
+            return base
+        return Answer(text, base.evidence, base.sources, base.formulas, base.assumptions,
+                      mode=f'LLM ({model}) + проверка чисел кодом', note='Все числа ответа найдены в расчётных данных.',
+                      kind=base.kind)
 
-# ==========================================================================
-# 6. Прогноз набора
-# ==========================================================================
-with tab_fc:
-    st.subheader('Прогноз набора на 2026–2027 (бонус)')
-    st.warning('Всего **3 наблюдения** на ОП. Это один год изменения плюс один — для тренда, но не для оценки случайного разброса. '
-               'Прогноз — ориентир, а не обещание.')
-    fc = eng.forecast_enrollment(data)
-    pick = st.selectbox('ОП', fc['op_id'].tolist(), format_func=lambda o: f'{o} · {names.get(o, o)}', key='fc_op')
-    row = fc[fc['op_id'] == pick].iloc[0]
-    hist = data['История_набора']
-    hist = hist[hist['op_id'] == pick].sort_values('учебный_год')
-    xs = hist['учебный_год'].astype(str).tolist()
-    fig = go.Figure()
-    fig.add_scatter(x=xs, y=hist['зачислено'], mode='lines+markers', name='Зачислено', line=dict(color=C_FOT))
-    fig.add_scatter(x=xs, y=hist['план_набора'], mode='lines+markers', name='План набора', line=dict(color='#b8c0cc', dash='dot'))
-    nxt = '2026–2027'
-    fig.add_scatter(x=[nxt], y=[row['прогноз (тренд)']], mode='markers', name='Прогноз (тренд)',
-                    marker=dict(size=12, color=C_OVER),
-                    error_y=dict(type='data', symmetric=False, array=[row['верхняя граница'] - row['прогноз (тренд)']],
-                                 arrayminus=[row['прогноз (тренд)'] - row['нижняя граница']], color=C_OVER))
-    fig.update_layout(title=f'{names.get(pick, pick)}: история и прогноз зачисления', height=400, legend=dict(orientation='h', y=1.12))
-    show_plot(fig, 'fc_plot')
-    c1, c2, c3 = st.columns(3)
-    c1.metric('Прогноз (тренд)', f"{row['прогноз (тренд)']:.0f}")
-    c2.metric('Диапазон', f"{row['нижняя граница']:.0f} – {row['верхняя граница']:.0f}")
-    c3.metric('Ширина диапазона', f"{row['ширина диапазона, %']:.0f}% от прогноза")
-    show_df(style_money(fc.drop(columns=['наблюдений']), [], ['ширина диапазона, %', 'прирост YoY, %', 'выполнение плана (посл. год), %'], digits=0)
-            .format({'прогноз (тренд)': '{:.1f}', 'нижняя граница': '{:.1f}', 'верхняя граница': '{:.1f}'}))
-    st.markdown("""
-**Почему трёх наблюдений недостаточно для точного прогноза**
-- Линейный тренд по трём точкам имеет всего **1 степень свободы**: два параметра (наклон и сдвиг) подгоняются под три числа, поэтому статистическая неопределённость огромна (t-критерий 80% при df = 1 равен 3,08).
-- Одна аномальная кампания, изменение правил приёма или демографическая волна смещают тренд сильнее, чем он «подтверждается» данными.
-- Нет сезонности, макрофакторов, конверсии заявок в зачисление по каналам.
-- Диапазон здесь = от минимума до максимума четырёх простых методов (последнее значение, среднее, тренд, средний YoY), расширенный 80%-интервалом регрессии. Для планирования используйте его границы, а не точку.
-- Для реального внедрения нужны 8–10 лет данных, демография выпускников, ценовая политика и конкуренты.""")
 
-# ==========================================================================
-# 7. Методика
-# ==========================================================================
-with tab_doc:
-    st.subheader('Методика, допущения и границы решения')
-    st.markdown(r"""
-**Формулы (учебная модель, тенге, один учебный год)**
-- Доход ОП = Σ по курсам (контракт_полный × тариф + контракт_со_скидкой × тариф × (1 − скидка) + грант × финансирование_гранта)
-- Годовой ФОТ преподавателя = зарплата × месяцев × (1 + начисления). Доля на ОП = ФОТ × часы на ОП / все часы преподавателя
-- Прямые затраты ОП = Σ строк «Прямые_затраты» по op_id
-- Накладные ОП = Σ по центрам (сумма центра × драйвер ОП / Σ драйвера 12 ОП); students ↔ студентов_активных, area_m2 ↔ площадь_м², lab_hours ↔ лабораторные_часы
-- Итого затраты = ФОТ + прямые + накладные; Результат = Доход − Итого затраты
-- Рентабельность = Результат / Доход × 100%; Себестоимость студента = Итого затраты / активные студенты (при 0 — «н/д»)
+# --------------------------------------------------------------------------
+# Защита от выдуманных чисел
+# --------------------------------------------------------------------------
+_NUM = re.compile(r'(?<![\w.])[-−+]?\d[\d   ]*(?:[.,]\d+)?')
 
-**Принципы**
-- Все суммы считает проверяемый код (`engine.py`); ИИ не вычисляет деньги, а объясняет посчитанное и показывает источник и формулу.
-- «Сырые_сигналы» — внешний набор для проверки качества; в P&L не используется (проверяется автоматически на вкладке Data Quality).
-- Округление только на экране, внутри расчёта — полная точность.
 
-**Границы решения**
-- Финансовый результат ≠ кассовый остаток; налог на прибыль, амортизация, стипендии, инвестиции, исследования не моделируются.
-- Распределение накладных по драйверам — упрощение; в реальности модель утверждают финансово-экономические службы университета.
-- What-If линейный: нет порогов (новые группы/потоки), эластичности спроса и ограничений мощностей.
-- Финансовый результат не должен быть единственным основанием для закрытия ОП: учитываются академические, кадровые, стратегические и социальные факторы.
+def _to_float(tok: str):
+    t = tok.replace(' ', '').replace(' ', '').replace(' ', '').replace('−', '-').replace(',', '.').lstrip('+')
+    try:
+        return float(t)
+    except ValueError:
+        return None
 
-**Что нужно для реального внедрения**
-Фактические платежи и дебиторка по студентам, ведомости штатного расписания и фактической нагрузки, учёт затрат по центрам ответственности, реальные площади и график занятости помещений, история набора за 8–10 лет, утверждённая методика распределения накладных, роли и доступы, аудит расчётов.
 
-Данные синтетические; персональные данные и ИИН не используются.""")
+def numbers_in(text: str) -> list:
+    out = []
+    for m in _NUM.finditer(text):
+        v = _to_float(m.group(0))
+        if v is not None:
+            out.append((m.group(0).strip(), v))
+    return out
+
+
+def unverified_numbers(answer_text: str, facts_text: str) -> list:
+    """Числа из ответа LLM, которых нет в расчётных данных.
+
+    Допускаются только округления: тенге — до целого (±1), «млн»/«млрд» — до 1–2 знаков,
+    проценты и малые величины — до 2 знаков. Годы и числа ≤ 20 (перечисления) игнорируются.
+    """
+    base = sorted({abs(v) for _, v in numbers_in(facts_text)})
+    arr = np.array(base) if base else np.array([0.0])
+    bad = []
+    for raw, v in numbers_in(answer_text):
+        av = abs(v)
+        if av <= 20 or 2000 <= av <= 2100:
+            continue
+        tol_abs = 1.0 if av >= 1000 else 0.006
+        ok = bool(np.any(np.abs(arr - av) <= tol_abs))
+        ok = ok or bool(np.any(np.abs(arr / 1e6 - av) <= 0.051)) or bool(np.any(np.abs(arr / 1e9 - av) <= 0.051))
+        if not ok:
+            bad.append(raw)
+    return bad
