@@ -17,6 +17,7 @@ import streamlit as st
 
 import engine as eng
 from ai_analyst import EXAMPLES, Analyst, money, pct, tg
+from llm_router import get_router
 from theme import C_DIRECT, C_FOT, C_OVER, C_REV, NEG, NEUTRAL, PLOT_CFG, POS, hero, inject_css, kpi
 
 st.set_page_config(page_title='Profitability AI', page_icon='📊', layout='wide')
@@ -122,12 +123,16 @@ with st.sidebar:
     faculties = sorted(result['факультет'].dropna().unique().tolist())
     sel_fac = st.multiselect('Факультет', faculties, default=faculties)
     profit_filter = st.radio('Рентабельность', ['Все', 'Прибыльные', 'Убыточные'], horizontal=True)
-    with st.expander('🤖 Настройки ИИ-аналитика'):
-        st.caption('Без ключа работает локальный режим (формулы + шаблоны). С ключом Claude лишь '
-                   'переформулирует ответ, а каждое число проверяется кодом.')
-        api_key = st.text_input('API key: Anthropic (sk-ant-…) или OpenRouter (sk-or-…), необязательно', type='password',
-                                value=os.environ.get('ANTHROPIC_API_KEY') or os.environ.get('OPENROUTER_API_KEY', ''))
-        use_llm = st.checkbox('Использовать LLM для формулировок', value=False, disabled=not api_key)
+    with st.expander('🤖 ИИ-аналитик: модели'):
+        _router = get_router()
+        if _router.enabled():
+            st.caption('Ключи и цепочка моделей заданы в коде (llm_config.py). При лимите модели запрос '
+                       'автоматически уходит на следующую.')
+        else:
+            st.caption('Ключи не заданы в llm_config.py / окружении / .env — работает локальный режим '
+                       '(формулы + шаблоны).')
+        for _name, _state in _router.status():
+            st.markdown(f'{"🟢" if _state == "готова" else "⚪" if _state == "нет ключа" else "🟠"} {_name} — {_state}')
     st.download_button('⬇ Скачать результаты (Excel)', to_excel_bytes(result, controls, anomalies, core_warn),
                        file_name='profitability_results.xlsx',
                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
@@ -429,7 +434,7 @@ with tab_ai:
         with st.chat_message('user'):
             st.markdown(question)
         with st.chat_message('assistant'):
-            ans = analyst.answer(question, llm=bool(use_llm and api_key), api_key=api_key or None)
+            ans = analyst.answer(question)
             render_answer(ans)
         st.session_state.chat.append({'role': 'assistant', 'answer': ans})
     if st.session_state.chat and st.button('Очистить диалог'):
