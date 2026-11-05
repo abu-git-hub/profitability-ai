@@ -220,3 +220,66 @@ def test_number_guard_rejects_lookalike(data, calc):
     facts = a.facts_json(base)
     assert ai.unverified_numbers('Убыток −99 999 999 ₸', facts) == ['−99 999 999']
     assert ai.unverified_numbers(base.text, facts) == []
+
+
+# ------------------------------ LLM-роутер и рамки проекта ------------------------------
+import llm_router as lr  # noqa: E402
+
+CHAIN = [dict(name='A', provider='anthropic', model='a1', key='K_A'),
+         dict(name='B', provider='openai', model='b1', key='K_B', base_url='http://x'),
+         dict(name='C', provider='openai', model='c1', key='K_C', base_url='http://x')]
+
+
+@pytest.fixture
+def keys(monkeypatch):
+    monkeypatch.setattr(lr.cfg, 'API_KEYS', {'K_A': 'a', 'K_B': 'b', 'K_C': ''})
+    monkeypatch.setattr(lr, '_read_env_file', lambda: {})
+
+
+def test_router_switches_on_limit_and_remembers(keys, monkeypatch):
+    calls = []
+
+    def fake(m, key, system, user, mt):
+        calls.append(m['name'])
+        if m['name'] == 'A':
+            raise lr._HTTPFail(429, 'limit', 120)
+        return 'ответ B'
+    monkeypatch.setattr(lr, '_CALLERS', {'anthropic': fake, 'openai': fake})
+    r = lr.LLMRouter(CHAIN)
+    rep = r.complete('s', 'u')
+    assert rep.text == 'ответ B' and 'B' in rep.model_label and 'лимит' in rep.switched[0]
+    r.complete('s', 'u')
+    assert calls == ['A', 'B', 'B']          # A на паузе, повторно не дёргается; C без ключа пропущена
+
+
+def test_router_all_fail_and_no_keys(keys, monkeypatch):
+    monkeypatch.setattr(lr, '_CALLERS', {k: (lambda *a: (_ for _ in ()).throw(lr._HTTPFail(500, 'server'))) for k in ('anthropic', 'openai')})
+    with pytest.raises(lr.AllModelsFailed):
+        lr.LLMRouter(CHAIN).complete('s', 'u')
+    monkeypatch.setattr(lr.cfg, 'API_KEYS', {})
+    assert not lr.LLMRouter(CHAIN).enabled()
+
+
+def test_ai_out_of_scope_never_calls_llm(analyst, keys, monkeypatch):
+    def boom(*a):
+        raise AssertionError('LLM не должна вызываться вне рамок проекта')
+    monkeypatch.setattr(lr, '_CALLERS', {'anthropic': boom, 'openai': boom})
+    r = lr.LLMRouter(CHAIN)
+    for q in ('Расскажи анекдот', 'Какая погода в Астане?', 'Напиши код на питоне', 'Кто президент США?'):
+        a = analyst.answer(q, router=r)
+        assert a.kind == 'out_of_scope', q
+
+
+def test_ai_in_scope_uses_llm_with_fallback_and_number_check(analyst, keys, monkeypatch):
+    def fake(m, key, system, user, mt):
+        if m['name'] == 'A':
+            raise lr._HTTPFail(429, 'limit')
+        assert 'ТОЛЬКО по теме проекта' in system
+        return 'Убыточных ОП 3 из 12.'
+    monkeypatch.setattr(lr, '_CALLERS', {'anthropic': fake, 'openai': fake})
+    a = analyst.answer('Какие ОП убыточны?', router=lr.LLMRouter(CHAIN))
+    assert a.mode.startswith('LLM: B') and 'Переключение' in a.note
+    # выдуманные числа отклоняются
+    monkeypatch.setattr(lr, '_CALLERS', {k: (lambda *a: 'Убыток 99 999 999 ₸') for k in ('anthropic', 'openai')})
+    b = analyst.answer('Какие ОП убыточны?', router=lr.LLMRouter(CHAIN))
+    assert b.mode.startswith('локальный') and 'отклонён' in b.note
